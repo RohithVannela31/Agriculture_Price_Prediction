@@ -1,0 +1,371 @@
+---
+title: "Agricultural Commodity Price Prediction in India Using R"
+author: 'Name: Rohith Vannela | Roll No: 160124771061'
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 7, fig.height = 3.2, fig.align = "center")
+
+packages <- c("readr", "dplyr", "tidyr", "ggplot2", "lubridate",
+              "forecast", "zoo", "knitr")
+for (p in packages) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(readr); library(dplyr); library(tidyr); library(ggplot2)
+library(lubridate); library(forecast); library(knitr)
+```
+
+# Introduction and Problem Statement
+
+Agricultural commodity prices in India change over time because of supply and
+demand, seasons, weather and market conditions. These changes make it hard for
+farmers, traders and consumers to plan. This project studies historical market
+prices and builds time-series models to forecast future prices.
+
+# Objectives
+
+1. Explore historical minimum, modal and maximum prices of a commodity.
+2. Identify yearly trends and seasonal patterns.
+3. Compare three forecasting models: Baseline, Moving Average and SARIMA.
+4. Evaluate the models with MAE, RMSE and MAPE, and forecast one year ahead.
+
+# Dataset
+
+- **Name:** Daily Commodity Prices India
+- **Source:** Kaggle (originally from India's AGMARKNET system)
+- **URL:** <https://www.kaggle.com/datasets/khandelwalmanas/daily-commodity-prices-india>
+- **Content:** daily wholesale market prices (Rs per quintal) by state, district,
+  market, commodity and variety.
+- **Used here:** yearly files for 2015 to 2025.
+
+# Data Preparation
+
+Settings for the selected series are kept in one place. Change them to analyse
+another commodity.
+
+```{r config}
+data_folder     <- "C:/v sem/IDS/csv"      # folder containing 2015.csv ... 2025.csv
+rds_file        <- "monthly_data.rds"      # cached monthly data
+selected_state     <- "Telangana"
+selected_commodity <- "Brinjal"
+selected_variety   <- "Brinjal"
+prediction_year    <- 2026
+```
+
+Each yearly file is cleaned (invalid dates and non-positive prices removed) and
+daily prices are averaged to monthly values. The result is cached in an `.rds`
+file so the documentation knits quickly after the first run.
+
+```{r load-data}
+if (file.exists(rds_file)) {
+  monthly_data <- readRDS(rds_file)
+} else {
+  monthly_data <- bind_rows(lapply(2015:2025, function(yr) {
+    read_csv(file.path(data_folder, paste0(yr, ".csv")),
+             col_types = cols(.default = col_guess(),
+                              Arrival_Date = col_character(),
+                              Min_Price = col_double(),
+                              Max_Price = col_double(),
+                              Modal_Price = col_double()),
+             show_col_types = FALSE) %>%
+      mutate(Arrival_Date = as.Date(parse_date_time(Arrival_Date,
+                                    orders = c("ymd", "dmy", "mdy"),
+                                    quiet = TRUE))) %>%
+      filter(!is.na(Arrival_Date), Min_Price > 0, Max_Price > 0,
+             Modal_Price > 0) %>%
+      mutate(State = trimws(State), Commodity = trimws(Commodity),
+             Variety = trimws(Variety),
+             Month = floor_date(Arrival_Date, "month")) %>%
+      group_by(State, Commodity, Variety, Month) %>%
+      summarise(Min_Price = mean(Min_Price), Max_Price = mean(Max_Price),
+                Modal_Price = mean(Modal_Price), .groups = "drop")
+  }))
+  saveRDS(monthly_data, rds_file)
+}
+
+# Convert Rs per quintal to Rs per kg (1 quintal = 100 kg)
+monthly_data <- monthly_data %>%
+  select(State, Commodity, Variety, Month,
+         Min_Price, Max_Price, Modal_Price) %>%
+  mutate(Month = as.Date(Month),
+         across(c(Min_Price, Max_Price, Modal_Price), ~ .x / 100))
+```
+
+A helper builds a continuous monthly series for one price column. Missing
+months are filled by linear interpolation.
+
+```{r helpers}
+prepare_series <- function(data, price_column) {
+  s <- data %>%
+    group_by(Month) %>%
+    summarise(Price = mean(.data[[price_column]], na.rm = TRUE),
+              .groups = "drop") %>%
+    filter(is.finite(Price), Price > 0) %>%
+    arrange(Month) %>%
+    complete(Month = seq(min(Month), max(Month), by = "month")) %>%
+    arrange(Month)
+  s$Price <- zoo::na.approx(s$Price, na.rm = FALSE)
+  s$Price <- zoo::na.locf(s$Price, na.rm = FALSE)
+  s$Price <- zoo::na.locf(s$Price, fromLast = TRUE, na.rm = FALSE)
+  s
+}
+
+selected_data <- monthly_data %>%
+  filter(State == selected_state, Commodity == selected_commodity,
+         Variety == selected_variety)
+
+stopifnot(nrow(selected_data) > 0)
+
+eda <- prepare_series(selected_data, "Min_Price") %>% rename(Minimum = Price) %>%
+  inner_join(prepare_series(selected_data, "Modal_Price") %>%
+               rename(Modal = Price), by = "Month") %>%
+  inner_join(prepare_series(selected_data, "Max_Price") %>%
+               rename(Maximum = Price), by = "Month") %>%
+  mutate(Year = year(Month), MonthLab = factor(month.abb[month(Month)],
+                                               levels = month.abb))
+```
+
+The selected series is **`r selected_commodity`** (variety
+`r selected_variety`) in **`r selected_state`**, with
+**`r nrow(eda)` monthly observations** from
+`r format(min(eda$Month), "%b %Y")` to `r format(max(eda$Month), "%b %Y")`.
+
+# Exploratory Analysis
+
+## Summary statistics (Rs per kg)
+
+```{r summary-table}
+f <- function(x) round(c(mean(x), median(x), sd(x), min(x), max(x),
+                         sd(x) / mean(x) * 100), 2)
+kable(data.frame(
+  Statistic = c("Mean", "Median", "Std deviation", "Lowest", "Highest",
+                "Variation (CV %)"),
+  Minimum = f(eda$Minimum), Modal = f(eda$Modal), Maximum = f(eda$Maximum)))
+```
+
+# Visualization
+
+## Heatmap of modal price by month and year
+
+```{r heatmap, fig.height=3.6}
+ggplot(eda, aes(MonthLab, factor(Year), fill = Modal)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(Modal, 0)), size = 3) +
+  scale_fill_gradient(low = "#fff5eb", high = "#d94801") +
+  scale_y_discrete(limits = rev) +
+  labs(x = "Month", y = "Year", fill = "Rs/kg") +
+  theme_minimal()
+```
+
+## Average modal price per year
+
+```{r yearly}
+eda %>% group_by(Year) %>% summarise(Average = mean(Modal), .groups = "drop") %>%
+  ggplot(aes(factor(Year), Average)) +
+  geom_col(fill = "#5b9bd5") +
+  geom_text(aes(label = round(Average, 1)), vjust = -0.4, size = 3) +
+  labs(x = "Year", y = "Average modal price (Rs/kg)") +
+  theme_minimal()
+```
+
+```{r eda-text, include=FALSE}
+season <- eda %>% group_by(MonthLab) %>%
+  summarise(m = mean(Modal), .groups = "drop")
+season_hi <- season[which.max(season$m), ]
+season_lo <- season[which.min(season$m), ]
+yearly <- eda %>% group_by(Year) %>% summarise(a = mean(Modal), .groups = "drop")
+```
+
+On average, the modal price is highest in **`r season_hi$MonthLab`**
+(Rs `r round(season_hi$m, 2)`/kg) and lowest in **`r season_lo$MonthLab`**
+(Rs `r round(season_lo$m, 2)`/kg). The yearly average ranged from
+Rs `r round(min(yearly$a), 2)`/kg (`r yearly$Year[which.min(yearly$a)]`) to
+Rs `r round(max(yearly$a), 2)`/kg (`r yearly$Year[which.max(yearly$a)]`).
+
+# Prediction Models
+
+Three models are compared. The last 12 months are held out as a test set; the
+models are trained on the earlier months.
+
+- **Baseline:** every future month equals the last observed price.
+- **Moving Average:** average of the last 3 months, rolled forward.
+- **SARIMA:** seasonal ARIMA with a 12-month cycle, fitted on log prices with
+  forced seasonal differencing (`auto.arima`, `D = 1`, `lambda = 0`).
+
+The model with the lowest RMSE on the test set is refitted on all data to
+forecast the selected year.
+
+```{r models}
+fit_sarima <- function(values, start_month) {
+  s <- ts(values, start = c(year(start_month), month(start_month)),
+          frequency = 12)
+  fit <- tryCatch(auto.arima(s, seasonal = TRUE, D = 1, lambda = 0),
+                  error = function(e) NULL)
+  if (is.null(fit))
+    fit <- tryCatch(auto.arima(s, seasonal = TRUE, lambda = 0),
+                    error = function(e) NULL)
+  fit
+}
+
+ma_forecast <- function(history, h, window = 3) {
+  out <- numeric(h)
+  for (i in seq_len(h)) {
+    out[i] <- mean(tail(history, window))
+    history <- c(history, out[i])
+  }
+  out
+}
+
+metric_row <- function(actual, predicted, model) {
+  e  <- actual - predicted
+  ok <- is.finite(predicted) & actual != 0
+  data.frame(Model = model, MAE = mean(abs(e)), RMSE = sqrt(mean(e^2)),
+             MAPE = if (any(ok)) mean(abs(e[ok] / actual[ok])) * 100 else NA)
+}
+
+forecast_series <- function(data, price_column, year_to_predict) {
+  s      <- prepare_series(data, price_column)
+  stopifnot(nrow(s) >= 36)
+  values <- s$Price
+  start  <- min(s$Month)
+  last_m <- max(s$Month)
+  horizon <- (year_to_predict - year(last_m)) * 12 + (12 - month(last_m))
+  stopifnot(horizon >= 1)
+
+  train <- head(values, length(values) - 12)
+  test  <- tail(values, 12)
+
+  base_t  <- rep(tail(train, 1), 12)
+  ma_t    <- ma_forecast(train, 12)
+  fit_t   <- fit_sarima(train, start)
+  sarima_t <- if (is.null(fit_t)) rep(NA_real_, 12) else
+    as.numeric(forecast(fit_t, h = 12)$mean)
+
+  metrics <- bind_rows(metric_row(test, base_t, "Baseline"),
+                       metric_row(test, ma_t, "Moving Average"),
+                       metric_row(test, sarima_t, "SARIMA"))
+  ok   <- metrics[is.finite(metrics$RMSE), ]
+  best <- ok$Model[which.min(ok$RMSE)]
+
+  pred <- switch(best,
+    "Baseline"       = rep(tail(values, 1), horizon),
+    "Moving Average" = ma_forecast(values, horizon),
+    "SARIMA"         = as.numeric(forecast(fit_sarima(values, start),
+                                           h = horizon)$mean))
+
+  all_f <- data.frame(Month = seq(last_m %m+% months(1), by = "month",
+                                  length.out = horizon),
+                      Price = pmax(pred, 0.01))
+  list(forecast = filter(all_f, year(Month) == year_to_predict),
+       metrics = metrics, best = best,
+       holdout = data.frame(Month = tail(s$Month, 12), Actual = test,
+                            Baseline = base_t, `Moving Average` = ma_t,
+                            SARIMA = sarima_t, check.names = FALSE))
+}
+
+targets <- c(Minimum = "Min_Price", Modal = "Modal_Price", Maximum = "Max_Price")
+res <- lapply(targets, function(tg) forecast_series(selected_data, tg,
+                                                    prediction_year))
+```
+
+# Results
+
+## Model comparison on the 12-month test set (errors in Rs per kg)
+
+```{r metrics}
+bind_rows(lapply(names(res), function(n)
+  cbind(Price = n, res[[n]]$metrics))) %>%
+  mutate(across(c(MAE, RMSE, MAPE), ~ round(.x, 2))) %>%
+  kable()
+```
+
+```{r holdout-plot}
+res$Modal$holdout %>%
+  pivot_longer(-Month, names_to = "Series", values_to = "Price") %>%
+  ggplot(aes(Month, Price, colour = Series, linewidth = Series == "Actual")) +
+  geom_line(na.rm = TRUE) +
+  scale_linewidth_manual(values = c(`TRUE` = 1.4, `FALSE` = 0.7), guide = "none") +
+  labs(title = "Test period: actual vs predicted modal price",
+       x = "Month", y = "Rs per kg", colour = NULL) +
+  theme_minimal()
+```
+
+```{r result-text, include=FALSE}
+fc <- data.frame(Month = res$Modal$forecast$Month,
+                 Minimum = pmin(res$Minimum$forecast$Price, res$Modal$forecast$Price),
+                 Modal   = res$Modal$forecast$Price,
+                 Maximum = pmax(res$Maximum$forecast$Price, res$Modal$forecast$Price))
+peak <- fc[which.max(fc$Modal), ]
+low  <- fc[which.min(fc$Modal), ]
+mm   <- res$Modal$metrics
+best_modal <- res$Modal$best
+```
+
+For the modal price, the selected model is **`r best_modal`**. Its test RMSE is
+`r round(mm$RMSE[mm$Model == best_modal], 2)` Rs/kg, compared with
+`r round(mm$RMSE[mm$Model == "Baseline"], 2)` for the Baseline and
+`r round(mm$RMSE[mm$Model == "Moving Average"], 2)` for the Moving Average.
+
+## Forecast for `r prediction_year` (Rs per kg)
+
+```{r forecast-table}
+fc %>% mutate(Month = format(Month, "%b %Y"), across(-Month, ~ round(.x, 2))) %>%
+  kable()
+```
+
+```{r forecast-plot}
+fc$Label <- factor(format(fc$Month, "%b"), levels = format(fc$Month, "%b"))
+fc$Status <- ifelse(fc$Modal == max(fc$Modal), "Highest",
+                    ifelse(fc$Modal == min(fc$Modal), "Lowest", "Other"))
+ggplot(fc, aes(Label, Modal, fill = Status)) +
+  geom_col() +
+  geom_text(aes(label = round(Modal, 1)), vjust = -0.4, size = 3) +
+  scale_fill_manual(values = c(Highest = "#d9534f", Lowest = "#5cb85c",
+                               Other = "#5b9bd5")) +
+  labs(title = paste("Predicted modal price by month,", prediction_year),
+       x = "Month", y = "Rs per kg", fill = NULL) +
+  theme_minimal()
+```
+
+The highest predicted modal price is in **`r format(peak$Month, "%B %Y")`**
+(Rs `r round(peak$Modal, 2)`/kg) and the lowest is in
+**`r format(low$Month, "%B %Y")`** (Rs `r round(low$Modal, 2)`/kg).
+
+# Conclusion
+
+- The `r nrow(eda)`-month history of `r selected_commodity` in
+  `r selected_state` shows a clear seasonal pattern, with the highest average
+  prices in `r season_hi$MonthLab` and the lowest in `r season_lo$MonthLab`.
+- On the 12-month test set, **`r best_modal`** had the lowest RMSE for the modal
+  price (`r round(mm$RMSE[mm$Model == best_modal], 2)` Rs/kg).
+- The advantage of SARIMA over the Baseline can be small, so forecasts are
+  estimates and not guarantees. Accuracy also falls for years further from the
+  last observed data.
+- Limitations: the test uses only 12 months, missing months are interpolated,
+  and weather or policy effects are not modelled.
+- Future work: add rainfall and arrival quantities, try other models, and
+  evaluate with rolling-origin cross-validation.
+
+# Links
+
+- **Dataset:** <https://www.kaggle.com/datasets/khandelwalmanas/daily-commodity-prices-india>
+
+# References
+
+1. Kaggle. *Daily Commodity Prices India* (AGMARKNET data).
+   <https://www.kaggle.com/datasets/khandelwalmanas/daily-commodity-prices-india>
+2. Hyndman, R. J., & Athanasopoulos, G. *Forecasting: Principles and Practice*
+   (3rd ed.). OTexts. <https://otexts.com/fpp3/>
+3. Hyndman, R. J., & Khandakar, Y. (2008). Automatic time series forecasting:
+   the forecast package for R. *Journal of Statistical Software*, 27(3).
